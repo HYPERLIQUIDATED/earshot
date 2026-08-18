@@ -1,0 +1,38 @@
+[package]
+name = "earshot"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+base64 = { version = "0.23.1", default-features = false, features = ["alloc"] }
+const-hex = { version = "1.19.1", default-features = false, features = ["alloc"] }
+futures-util = { version = "0.3.34", default-features = false, features = ["sink"] }
+rustls = { version = "0.23.43", default-features = false, features = ["aws-lc-rs", "std"] }
+rustls-pki-types = { version = "1.15.1", default-features = false, features = ["alloc"] }
+secp256k1 = { version = "0.31.1", default-features = false, features = ["recovery", "std"], optional = true }
+serde = { version = "1.0.229", default-features = false, features = ["derive", "std"] }
+serde_json = { version = "1.0.151", default-features = false, features = ["std"] }
+thiserror = { version = "2.0.20", default-features = false }
+tiny-keccak = { version = "2.0.2", features = ["keccak"] }
+tokio = { version = "1.53.1", default-features = false, features = ["macros", "net", "rt", "sync", "time"] }
+tokio-rustls = { version = "0.26.4", default-features = false, features = ["aws-lc-rs"] }
+tokio-tungstenite = { version = "0.30.0", default-features = false, features = ["handshake"] }
+tracing = { version = "0.1.44", default-features = false, features = ["std"] }
+webpki-roots = { version = "1.0.9", default-features = false }
+
+[dev-dependencies]
+const-hex = "1"
+tokio = { version = "1.53.1", features = ["macros", "rt-multi-thread"] }
+
+[features]
+# Sender recovery. Off by default: it pulls in libsecp256k1, which needs a C
+# compiler, and a feed consumer that filters on `to` or the selector never
+# needs it.
+recover = ["dep:secp256k1"]
+
+[lints.clippy]
+all = { level = "deny", priority = -1 }
+pedantic = { level = "deny", priority = -1 }
+
+[lints.rust]
+missing_docs = "deny"
