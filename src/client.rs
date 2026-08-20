@@ -1,6 +1,6 @@
 //! The subscriber: connections, ordering, and the channel out.
 
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, VecDeque};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -130,6 +130,36 @@ impl ClientBuilder {
         self
     }
 
+    /// How long a gap is held open for another endpoint to fill before it is
+    /// reported. Defaults to 250ms.
+    ///
+    /// A message arriving ahead of the expected sequence number means the
+    /// endpoint that sent it is missing what comes between. Another endpoint
+    /// may still have it, so the merge waits this long before deciding the
+    /// messages are gone, and stops waiting the moment one of them arrives.
+    /// Nothing is held while the stream is contiguous, so the cost falls only
+    /// where there was already a hole.
+    ///
+    /// [`Duration::ZERO`] reports a gap on the first evidence of it: the
+    /// lowest latency, and the least chance of the redundancy helping.
+    #[must_use]
+    pub fn gap_grace(mut self, grace: Duration) -> Self {
+        self.config.gap_grace = grace;
+        self
+    }
+
+    /// Budget for opening a connection — name resolution, TCP, TLS and the
+    /// websocket upgrade together. Defaults to 10s.
+    ///
+    /// Each of those can block on a peer that accepts a connection and then
+    /// says nothing, and an attempt still in flight is one that
+    /// [`connect`](ClientBuilder::connect) may be waiting on.
+    #[must_use]
+    pub fn connect_timeout(mut self, timeout: Duration) -> Self {
+        self.config.connect_timeout = timeout;
+        self
+    }
+
     /// How long a connection may go without receiving anything — including
     /// the relay's own pings — before it is treated as dead. Defaults to 30s.
     #[must_use]
@@ -154,12 +184,18 @@ impl ClientBuilder {
         self
     }
 
-    /// How many messages may sit buffered before the reader stalls the
-    /// connections. Defaults to 1024.
+    /// How many messages may sit buffered at each stage before the reader
+    /// stalls the connections. Defaults to 1024.
     ///
     /// The buffer exists to absorb bursts, not to let a slow consumer fall
     /// arbitrarily behind: once it fills, reads stop and the relay eventually
     /// drops the connection rather than the client silently losing messages.
+    ///
+    /// Three things are bounded by this number — what the connections have
+    /// handed the merge, what the merge is holding across an open gap, and
+    /// what is waiting to be taken by [`FeedClient::recv`] — so a client can
+    /// hold up to three times it. A gap that reaches the bound is confirmed
+    /// early rather than held any longer.
     #[must_use]
     pub fn capacity(mut self, capacity: usize) -> Self {
         self.config.capacity = capacity;
@@ -251,7 +287,13 @@ impl ClientBuilder {
         drop(raw_tx);
         drop(ready_tx);
 
-        tokio::spawn(order(raw_rx, out_tx, config.resume_after));
+        tokio::spawn(order(
+            raw_rx,
+            out_tx,
+            config.resume_after,
+            config.gap_grace,
+            config.capacity,
+        ));
 
         // One endpoint coming up is enough to start, since the point of
         // listing several is that they fail independently. Only a client where
@@ -286,86 +328,216 @@ impl ClientBuilder {
 
 /// Merge every connection into one ordered, duplicate-free stream.
 ///
-/// Each connection delivers in order, so taking only messages past the
-/// high-water mark keeps the merged stream ordered as well: a message can
-/// only be behind the mark if some other connection already delivered it.
-/// The relay's replayed backlog is filtered by exactly the same rule, which
-/// is why seeding the mark with `resume_after` extends deduplication across a
-/// process restart.
+/// Each connection delivers in order, so a message behind the high-water mark
+/// is one some other connection already delivered, and dropping it is what
+/// makes the merged stream duplicate-free. The relay's replayed backlog is
+/// filtered by the same rule, which is why seeding the mark with
+/// `resume_after` extends deduplication across a process restart.
 ///
-/// The copies that lose are not simply discarded. Each one says how far
-/// behind its endpoint was, which is the only measurement of a relay drifting
-/// that exists before it fails outright.
+/// A message *ahead* of the mark is the interesting case, because it means
+/// something between is missing from whichever endpoint sent it — and another
+/// endpoint may still have it. Confirming the gap immediately would advance
+/// the mark past messages that are on their way, and discard them when they
+/// arrive: the one situation redundancy exists for would be the one it failed
+/// at. So a gap is held open, and closed early the moment another endpoint
+/// fills it. Nothing is held while the stream is contiguous, which is nearly
+/// always, so this costs latency only where there was already a hole.
+struct Merge {
+    /// The next sequence number to go out. `None` until the first message.
+    next_expected: Option<u64>,
+    /// Messages ahead of the mark, waiting for what comes before them.
+    held: BTreeMap<u64, (Arc<EndpointState>, FeedMessage)>,
+    /// When the gap stops waiting. On the runtime's clock, since it is a timer.
+    deadline: Option<tokio::time::Instant>,
+    /// Recent winners, for timing the losing copies against.
+    won_at: VecDeque<(u64, Instant, Arc<EndpointState>)>,
+    suppressed: u64,
+    delivered: bool,
+    grace: Duration,
+    capacity: usize,
+}
+
+impl Merge {
+    /// How many recent winners to remember. Covers several minutes at this
+    /// chain's rate.
+    const HISTORY: usize = 4096;
+
+    fn new(resume_after: Option<u64>, grace: Duration, capacity: usize) -> Self {
+        Self {
+            next_expected: resume_after.map(|last| last.saturating_add(1)),
+            held: BTreeMap::new(),
+            deadline: None,
+            won_at: VecDeque::with_capacity(Self::HISTORY),
+            suppressed: 0,
+            delivered: false,
+            grace,
+            capacity,
+        }
+    }
+
+    /// Take a copy off a connection.
+    ///
+    /// Anything behind the mark, or a second copy of something already
+    /// waiting, has lost; how late it was is recorded against its endpoint and
+    /// it goes no further.
+    fn offer(&mut self, endpoint: Arc<EndpointState>, message: FeedMessage) {
+        let sequence_number = message.sequence_number;
+        let already_held = self.held.contains_key(&sequence_number);
+
+        if self
+            .next_expected
+            .is_some_and(|expected| sequence_number < expected)
+            || already_held
+        {
+            self.suppressed += 1;
+            // Only a copy that lost to a *different* endpoint says anything
+            // about this one. An endpoint running several sockets produces a
+            // copy per socket, and counting its own slower ones as lateness
+            // would answer the wrong question: what matters is what reading
+            // only this endpoint would have cost, and it cost nothing on a
+            // message it won.
+            let against = if already_held {
+                self.held
+                    .get(&sequence_number)
+                    .map(|(winner, first)| (first.received_at, winner))
+            } else {
+                self.won_at.front().and_then(|(first, _, _)| {
+                    let offset = usize::try_from(sequence_number.checked_sub(*first)?).ok()?;
+                    let (_, won, winner) = self.won_at.get(offset)?;
+                    Some((*won, winner))
+                })
+            };
+            let lateness = against.and_then(|(won, winner)| {
+                (!Arc::ptr_eq(winner, &endpoint))
+                    .then(|| message.received_at.saturating_duration_since(won))
+            });
+            endpoint.discarded(sequence_number, lateness);
+            return;
+        }
+
+        self.held.insert(sequence_number, (endpoint, message));
+    }
+
+    /// The next message that can go out, if the one the mark is waiting for
+    /// has arrived.
+    fn take_ready(&mut self) -> Option<FeedMessage> {
+        // The first message ever seen sets the mark rather than being measured
+        // against one.
+        if self.next_expected.is_none() {
+            self.next_expected = self.held.keys().next().copied();
+        }
+        let expected = self.next_expected?;
+        let (endpoint, message) = self.held.remove(&expected)?;
+        self.next_expected = Some(expected + 1);
+
+        endpoint.took(expected);
+        if self.won_at.len() >= Self::HISTORY {
+            self.won_at.pop_front();
+        }
+        self.won_at
+            .push_back((expected, message.received_at, endpoint));
+
+        if !self.delivered {
+            self.delivered = true;
+            tracing::debug!(
+                suppressed = self.suppressed,
+                first = expected,
+                "first delivery; the replayed backlog before this point was dropped"
+            );
+        }
+        Some(message)
+    }
+
+    /// When the open gap stops waiting, arming the timer if it is not yet
+    /// running. `None` when there is no gap.
+    fn deadline(&mut self) -> Option<tokio::time::Instant> {
+        if self.held.is_empty() {
+            self.deadline = None;
+            return None;
+        }
+        Some(
+            *self
+                .deadline
+                .get_or_insert_with(|| tokio::time::Instant::now() + self.grace),
+        )
+    }
+
+    /// Whether the gap has to be closed before taking anything more in.
+    ///
+    /// Holding a gap open costs memory the incoming channel would otherwise
+    /// be refusing to accept, so it is bounded by the same number. Both this
+    /// and the deadline are settled before the loop waits on anything, since
+    /// a channel with a message ready would otherwise be preferred to a timer
+    /// that has already expired, and the bound would not hold.
+    fn must_confirm(&mut self) -> bool {
+        match self.deadline() {
+            None => false,
+            Some(at) => self.held.len() >= self.capacity || at <= tokio::time::Instant::now(),
+        }
+    }
+
+    /// Give up on what is missing and resume from the oldest message held.
+    fn confirm_gap(&mut self) {
+        self.deadline = None;
+        let Some(&resumed) = self.held.keys().next() else {
+            return;
+        };
+        let expected = self.next_expected.unwrap_or(resumed);
+        let missed = resumed.saturating_sub(expected);
+        if let Some((_, message)) = self.held.get_mut(&resumed) {
+            message.missed_before = missed;
+        }
+        if missed > 0 {
+            tracing::warn!(
+                missed,
+                resumed_at = resumed,
+                "the feed skipped ahead; the missing messages can only be fetched from an RPC node"
+            );
+            // The mark jumped, so positions in the history no longer
+            // correspond to sequence numbers.
+            self.won_at.clear();
+        }
+        self.next_expected = Some(resumed);
+    }
+}
+
+/// Drive the merge: everything ready goes out, then either the gap is closed
+/// or the next copy is waited for.
 async fn order(
     mut rx: mpsc::Receiver<(Arc<EndpointState>, FeedMessage)>,
     tx: mpsc::Sender<FeedMessage>,
     resume_after: Option<u64>,
+    grace: Duration,
+    capacity: usize,
 ) {
-    /// How many recent winners to remember, for timing the losers against.
-    /// Covers several minutes at this chain's rate.
-    const HISTORY: usize = 4096;
+    let mut merge = Merge::new(resume_after, grace, capacity);
 
-    let mut next_expected = resume_after.map(|last| last.saturating_add(1));
-    let mut suppressed = 0u64;
-    let mut delivered = false;
-    let mut won_at: VecDeque<(u64, Instant, Arc<EndpointState>)> = VecDeque::with_capacity(HISTORY);
-
-    while let Some((endpoint, mut message)) = rx.recv().await {
-        if let Some(expected) = next_expected {
-            if message.sequence_number < expected {
-                suppressed += 1;
-                // Contiguous and increasing, so the winner is at a known offset.
-                // Only a copy that lost to a *different* endpoint says
-                // anything about this one. An endpoint running several
-                // sockets produces a copy per socket, and counting its own
-                // slower ones as lateness would answer the wrong question:
-                // what matters is what reading only this endpoint would have
-                // cost, and it cost nothing on a message it won.
-                let lateness = won_at.front().and_then(|(first, _, _)| {
-                    let offset =
-                        usize::try_from(message.sequence_number.checked_sub(*first)?).ok()?;
-                    let (_, won, winner) = won_at.get(offset)?;
-                    (!Arc::ptr_eq(winner, &endpoint))
-                        .then(|| message.received_at.saturating_duration_since(*won))
-                });
-                endpoint.discarded(message.sequence_number, lateness);
-                continue;
-            }
-            message.missed_before = message.sequence_number - expected;
-            if message.missed_before > 0 {
-                tracing::warn!(
-                    missed = message.missed_before,
-                    resumed_at = message.sequence_number,
-                    "the feed skipped ahead; the missing messages can only be fetched from an RPC node"
-                );
-                // The mark jumped, so positions in the history no longer
-                // correspond to sequence numbers.
-                won_at.clear();
+    loop {
+        while let Some(message) = merge.take_ready() {
+            if tx.send(message).await.is_err() {
+                return;
             }
         }
-        next_expected = Some(message.sequence_number + 1);
 
-        endpoint.took(message.sequence_number);
-        if won_at.len() >= HISTORY {
-            won_at.pop_front();
-        }
-        won_at.push_back((
-            message.sequence_number,
-            message.received_at,
-            Arc::clone(&endpoint),
-        ));
-
-        if !delivered {
-            delivered = true;
-            tracing::debug!(
-                suppressed,
-                first = message.sequence_number,
-                "first delivery; the replayed backlog before this point was dropped"
-            );
+        if merge.must_confirm() {
+            merge.confirm_gap();
+            continue;
         }
 
-        if tx.send(message).await.is_err() {
+        let incoming = match merge.deadline() {
+            None => rx.recv().await,
+            Some(at) => tokio::select! {
+                biased;
+                incoming = rx.recv() => incoming,
+                // The loop head confirms it; coming back through there is what
+                // keeps one decision in one place.
+                () = tokio::time::sleep_until(at) => continue,
+            },
+        };
+
+        let Some((endpoint, message)) = incoming else {
             return;
-        }
+        };
+        merge.offer(endpoint, message);
     }
 }

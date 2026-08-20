@@ -185,6 +185,10 @@ pub struct FeedMessage {
     /// inside the relay's backlog, whose reach has been seen anywhere from
     /// 560 to 3300 messages. Non-zero when an outage outlasted it, and then
     /// what passed during the outage can only be fetched from an RPC node.
+    ///
+    /// With more than one endpoint configured, this is reported only after
+    /// [`gap_grace`](crate::ClientBuilder::gap_grace) has passed without any
+    /// of the others supplying what is missing.
     pub missed_before: u64,
     /// Hash of the L2 block this message produced, as the sequencer computed
     /// it — available here before any node will serve it.
@@ -264,7 +268,10 @@ impl FeedMessage {
         // their payload verbatim rather than being forced through a parser
         // that was never meant for them.
         let kind = MessageKind::from_byte(header.kind);
-        if kind == MessageKind::L2Message && parsed.error.is_none() && !l2_msg.is_empty() {
+        if kind == MessageKind::L2Message && parsed.error.is_none() {
+            // Walked even when empty, so a message that should carry a payload
+            // and does not is reported rather than read as one carrying no
+            // transactions.
             parsed.walk(&l2_msg, 0);
         }
 

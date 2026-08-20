@@ -46,8 +46,19 @@ pub(crate) async fn run(
     let mut backoff = cfg.reconnect_min;
 
     loop {
-        let outcome = match connect(&endpoint.url, &cfg, &tls).await {
-            Ok(socket) => {
+        // Dialling is bounded and interruptible. Every step of it — DNS, TCP,
+        // TLS, the upgrade — can block on a peer that has accepted the
+        // connection and then gone quiet, and an attempt still in flight holds
+        // the readiness channel open, which would leave `connect` waiting on a
+        // client that is never going to come up.
+        let dialled = tokio::select! {
+            biased;
+            _ = shutdown.changed() => return,
+            result = timeout(cfg.connect_timeout, connect(&endpoint.url, &cfg, &tls)) => result,
+        };
+
+        let outcome = match dialled {
+            Ok(Ok(socket)) => {
                 tracing::debug!(connection = id, url = %endpoint.url, "feed connected");
                 endpoint.connected();
                 if let Some(ready) = ready.take() {
@@ -56,7 +67,7 @@ pub(crate) async fn run(
                 backoff = cfg.reconnect_min;
                 pump(socket, &endpoint, &cfg, &tx, &mut shutdown).await
             }
-            Err(e) => {
+            Ok(Err(e)) => {
                 let message = e.to_string();
                 // A refusal is not a blip. Climbing the backoff from its floor
                 // would spend several attempts on an endpoint that has already
@@ -72,6 +83,18 @@ pub(crate) async fn run(
                 }
                 Ended::Failed(message)
             }
+            Err(_) => Ended::Failed({
+                let message = format!("dialling timed out after {:?}", cfg.connect_timeout);
+                if let Some(ready) = ready.take() {
+                    let _ = ready
+                        .send(Err(Error::Connect {
+                            url: endpoint.url.clone(),
+                            message: message.clone(),
+                        }))
+                        .await;
+                }
+                message
+            }),
         };
 
         let reason = match outcome {

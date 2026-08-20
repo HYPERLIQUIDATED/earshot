@@ -103,6 +103,15 @@
 //!   sequence order with no repeats, no matter how many sockets or relays feed
 //!   them, or how often those reconnect into the middle of a replayed backlog.
 //!   That is what makes redundancy safe to add: the only cost is bandwidth.
+//! * **A gap is given a moment to fill before it is called one.** A message
+//!   arriving ahead of the expected sequence number means the endpoint that
+//!   sent it is missing what comes between, and another endpoint may still
+//!   have it. Confirming the gap on that first evidence would advance past
+//!   messages already on their way and discard them on arrival — failing at
+//!   exactly what the redundancy is for. So the merge holds the gap open for
+//!   [`gap_grace`](ClientBuilder::gap_grace), 250ms by default, and closes it
+//!   early the moment another endpoint fills it. A contiguous stream is never
+//!   held, so this costs latency only where there was already a hole.
 //! * **Redundancy is the main latency lever, at every percentile.** Sockets
 //!   stall independently and none is reliably the fast one: racing several to
 //!   one relay, each wins some share of the messages and none takes most of

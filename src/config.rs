@@ -24,6 +24,8 @@ pub(crate) const FEED_CLIENT_VERSION: &str = "2";
 #[derive(Debug, Clone)]
 pub(crate) struct Config {
     pub(crate) endpoints: Vec<Endpoint>,
+    pub(crate) connect_timeout: Duration,
+    pub(crate) gap_grace: Duration,
     pub(crate) read_timeout: Duration,
     pub(crate) ping_interval: Duration,
     pub(crate) reconnect_min: Duration,
@@ -39,6 +41,16 @@ impl Default for Config {
             // Empty stands for the mainnet default, which is filled in when
             // the client connects.
             endpoints: Vec::new(),
+            // Covers DNS, TCP, TLS and the upgrade together. A peer that
+            // accepts a connection and then says nothing would otherwise hold
+            // the attempt open for as long as the kernel allows.
+            connect_timeout: Duration::from_secs(10),
+            // How long a gap is held open for another endpoint to fill before
+            // it is reported. Long enough to cover an endpoint that is merely
+            // slow — their lateness runs to about 190ms at the 90th
+            // percentile — and short enough that confirming a real gap is not
+            // itself a delay worth noticing.
+            gap_grace: Duration::from_millis(250),
             // This chain produces about ten blocks a second and the relay
             // pings besides, so half a minute of complete silence means the
             // socket is dead rather than the chain being quiet.
@@ -62,6 +74,17 @@ impl Config {
         }
         if self.capacity == 0 {
             return Err(Error::Config("capacity must be at least 1".to_owned()));
+        }
+        // `tokio::time::interval` panics on a zero period, and a zero read
+        // budget expires the moment it is granted.
+        if self.ping_interval.is_zero() {
+            return Err(Error::Config("ping_interval must not be zero".to_owned()));
+        }
+        if self.read_timeout.is_zero() {
+            return Err(Error::Config("read_timeout must not be zero".to_owned()));
+        }
+        if self.connect_timeout.is_zero() {
+            return Err(Error::Config("connect_timeout must not be zero".to_owned()));
         }
         if self.reconnect_min > self.reconnect_max {
             return Err(Error::Config(

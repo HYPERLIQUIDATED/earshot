@@ -335,7 +335,7 @@ fn decode_access_list(rlp: &mut Rlp<'_>) -> Result<Vec<AccessListItem>, RlpError
     Ok(out)
 }
 
-fn decode_authorization_list(rlp: &mut Rlp<'_>) -> Result<Vec<Authorization>, RlpError> {
+fn decode_authorization_list(rlp: &mut Rlp<'_>) -> Result<Vec<Authorization>, TxError> {
     let mut list = rlp.next_list()?;
     let mut out = Vec::new();
     while !list.is_empty() {
@@ -343,7 +343,11 @@ fn decode_authorization_list(rlp: &mut Rlp<'_>) -> Result<Vec<Authorization>, Rl
         let chain_id = entry.next_u256()?;
         let address = entry.next_address()?;
         let nonce = entry.next_u64()?;
-        let y_parity = entry.next_u64()? == 1;
+        let parity = entry.next_u64()?;
+        if parity > 1 {
+            return Err(TxError::BadParity(parity));
+        }
+        let y_parity = parity == 1;
         let r = entry.next_u256()?;
         let s = entry.next_u256()?;
         entry.finish()?;
